@@ -13,7 +13,7 @@ import odoo
 
 from .exception import (NoSuchJobError,
                         FailedJobError,
-                        RetryableJobError)
+                        RetryableJobError, JobError)
 
 
 PENDING = 'pending'
@@ -518,21 +518,33 @@ class Job(object):
             date_created = dt_to_string(self.date_created)
             # The following values must never be modified after the
             # creation of the job
-            vals.update({'uuid': self.uuid,
-                         'name': self.description,
-                         'date_created': date_created,
-                         'model_name': self.model_name,
-                         'method_name': self.method_name,
-                         'record_ids': self.recordset.ids,
-                         'args': self.args,
-                         'kwargs': self.kwargs,
-                         })
-            # it the channel is not specified, lets the job_model compute
-            # the right one to use
-            if self.channel:
-                vals.update({'channel': self.channel})
-
+            vals.update(
+                {
+                    'user_id': self.env.uid,
+                    'channel': self.channel,
+                    # The following values must never be modified after the
+                    # creation of the job
+                    'uuid': self.uuid,
+                    'name': self.description,
+                    'func_string': self.func_string,
+                    'date_created': date_created,
+                    'model_name': self.model_name,
+                    'method_name': self.method_name,
+                    'job_function_id': self.job_function_id,
+                    'channel_method_name': self.job_function_name,
+                    'record_ids': self.recordset.ids,
+                    'args': self.args,
+                    'kwargs': self.kwargs,
+                }
+            )
             self.env[self.job_model_name].sudo().create(vals)
+
+    @property
+    def func_string(self):
+        args = [repr(arg) for arg in self.args]
+        kwargs = ["{}={!r}".format(key, val) for key, val in self.kwargs.items()]
+        all_args = ", ".join(args + kwargs)
+        return "{}.{}({})".format(self.model_name, self.method_name, all_args)
 
     def db_record(self):
         return self.db_record_from_uuid(self.env, self.uuid)
@@ -542,6 +554,23 @@ class Job(object):
         recordset = self.recordset.with_context(job_uuid=self.uuid)
         recordset = recordset.sudo(self.user_id)
         return getattr(recordset, self.method_name)
+
+    @property
+    def job_function_name(self):
+        func_model = self.env["queue.job.function"].sudo()
+        return func_model.job_function_name(self.model_name, self.method_name)
+
+    def _job_function_id(self):
+        func_model = self.env["queue.job.function"].sudo()
+        job_function_id = func_model.search([('name', '=', self.job_function_name)], limit=1)
+        if not job_function_id:
+            raise JobError(f"Could not find job function with name '{self.job_function_name}'")
+        return job_function_id
+
+    @property
+    def job_function_id(self):
+        job_function_id = self._job_function_id()
+        return job_function_id.id
 
     @property
     def identity_key(self):
@@ -592,10 +621,22 @@ class Job(object):
         else:
             self._eta = value
 
+    @property
+    def channel(self):
+        if self._channel:
+            return self._channel
+        job_function_id = self._job_function_id()
+        return job_function_id.channel
+
+    @channel.setter
+    def channel(self, value):
+        self._channel = value
+
     def set_pending(self, result=None, reset_retry=True):
         self.state = PENDING
         self.date_enqueued = None
         self.date_started = None
+        self.date_done = None
         if reset_retry:
             self.retry = 0
         if result is not None:

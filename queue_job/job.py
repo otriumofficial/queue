@@ -13,7 +13,8 @@ import odoo
 
 from .exception import (NoSuchJobError,
                         FailedJobError,
-                        RetryableJobError, JobError)
+                        RetryableJobError,
+                        JobError)
 
 
 PENDING = 'pending'

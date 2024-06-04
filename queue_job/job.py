@@ -304,7 +304,7 @@ class Job(object):
         """Check if a job to be executed with the same key exists."""
         existing = self.env['queue.job'].sudo().search(
             [('identity_key', '=', self.identity_key),
-             ('state', 'in', [PENDING, ENQUEUED])],
+             ('state', 'in', [PENDING, ENQUEUED, STARTED])],
             limit=1
         )
         return existing

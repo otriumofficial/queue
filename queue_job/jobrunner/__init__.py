@@ -139,9 +139,11 @@ def threaded_stop(server):
         runner_thread = None
     return res
 
-
-server.PreforkServer.__init__ = prefork__init__
-server.PreforkServer.process_spawn = prefork_process_spawn
-server.PreforkServer.worker_pop = prefork_worker_pop
+if _is_runner_enabled():
+    server.PreforkServer.__init__ = prefork__init__
+    server.PreforkServer.process_spawn = prefork_process_spawn
+    server.PreforkServer.worker_pop = prefork_worker_pop
+elif config.get('workers', 0) > 0:
+    _logger.info("jobrunner not started, because the root channel's capacity is set to 0")
 server.ThreadedServer.start = threaded_start
 server.ThreadedServer.stop = threaded_stop

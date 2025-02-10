@@ -148,7 +148,7 @@ import requests
 import odoo
 from odoo.tools import config
 
-from .channels import ChannelManager, PENDING, ENQUEUED, NOT_DONE
+from .channels import ChannelManager, PENDING, ENQUEUED, NOT_DONE, FAILED
 
 SELECT_TIMEOUT = 60
 ERROR_RECOVERY_DELAY = 5
@@ -214,19 +214,6 @@ def _async_http_get(scheme, host, port, user, password, db_name, job_uuid):
         response = session.get(url, timeout=30, auth=auth)
         response.raise_for_status()
 
-    # Method to set failed job (due to timeout, etc) as pending,
-    # to avoid keeping it as enqueued.
-    def set_job_pending():
-        connection_info = _connection_info_for(db_name)
-        conn = psycopg2.connect(**connection_info)
-        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
-        with closing(conn.cursor()) as cr:
-            cr.execute(
-                "UPDATE queue_job SET state=%s, "
-                "date_enqueued=NULL, date_started=NULL "
-                "WHERE uuid=%s and state=%s", (PENDING, job_uuid, ENQUEUED)
-            )
-
     # TODO: better way to HTTP GET asynchronously (grequest, ...)?
     #       if this was python3 I would be doing this with
     #       asyncio, aiohttp and aiopg
@@ -249,12 +236,8 @@ def _async_http_get(scheme, host, port, user, password, db_name, job_uuid):
             # for HTTP Response codes between 400 and 500 or a Server Error
             # for codes between 500 and 600
             response.raise_for_status()
-        except requests.Timeout:
-            set_job_pending()
         except Exception:
-            _logger.exception("exception in GET %s", url)
             session.cookies.clear()
-            set_job_pending()
     thread = threading.Thread(target=urlopen)
     thread.daemon = True
     thread.start()
@@ -342,6 +325,86 @@ class Database(object):
                        "WHERE uuid=%s",
                        (ENQUEUED, uuid))
 
+    def _query_requeue_dead_jobs(self):
+        return """
+            UPDATE
+                queue_job
+            SET
+                state=(
+                    CASE
+                        WHEN
+                            max_retries IS NOT NULL AND
+                            retry IS NOT NULL AND
+                            retry>=max_retries
+                        THEN 'failed'
+                        ELSE 'pending'
+                    END),
+                retry=(CASE WHEN state='started' THEN COALESCE(retry,0)+1 ELSE retry END),
+                exc_info=(
+                    CASE
+                        WHEN
+                            max_retries IS NOT NULL AND
+                            retry IS NOT NULL AND
+                            retry>=max_retries
+                        THEN 'Job not completed, max retries reached'
+                        ELSE exc_info
+                    END)
+            WHERE
+                id in (
+                    SELECT
+                        queue_job_id
+                    FROM
+                        queue_job_lock
+                    WHERE
+                        queue_job_id in (
+                            SELECT
+                                id
+                            FROM
+                                queue_job
+                            WHERE
+                                state IN ('enqueued','started')
+                                AND date_enqueued <
+                                (now() AT TIME ZONE 'utc' - INTERVAL '10 sec')
+                        )
+                    FOR UPDATE SKIP LOCKED
+                )
+            RETURNING uuid, state, name, method_name
+            """
+
+    def requeue_dead_jobs(self):
+        """
+        Set started and enqueued jobs but not locked to pending
+        A job is locked when it's being executed
+        When a job is killed, it releases the lock
+        If the number of retries exceeds the number of max retries,
+        the job is set as 'failed' with the error 'JobFoundDead'.
+        Adding a buffer on 'date_enqueued' to check
+        that it has been enqueued for more than 10sec.
+        This prevents from requeuing jobs before they are actually started.
+        When Odoo shuts down normally, it waits for running jobs to finish.
+        However, when the Odoo server crashes or is otherwise force-stopped,
+        running jobs are interrupted while the runner has no chance to know
+        they have been aborted.
+
+        Returns information about inactive jobs, those requeued and those
+        marked as failed.
+        """
+        pending_job_info = []
+        failed_job_info = []
+
+        with closing(self.conn.cursor()) as cr:
+            query = self._query_requeue_dead_jobs()
+            cr.execute(query)
+            for (uuid, state, name, method) in cr.fetchall():
+                if state == PENDING:
+                    pending_job_info.append((uuid, name, method))
+                    _logger.warning("Re-queued inactive job with UUID: %s", uuid)
+                elif state == FAILED:
+                    failed_job_info.append((uuid, name, method))
+                    _logger.warning("Inactive job marked as failed with UUID: %s", uuid)
+
+        return pending_job_info, failed_job_info
+
 
 class QueueJobRunner(object):
 
@@ -416,6 +479,11 @@ class QueueJobRunner(object):
                 for job_data in db.select_jobs('state in %s', (NOT_DONE,)):
                     self.channel_manager.notify(db_name, *job_data)
                 _logger.info('queue job runner ready for db %s', db_name)
+
+    def requeue_dead_jobs(self):
+        for db in self.db_by_name.values():
+            if db.has_queue_job:
+                db.requeue_dead_jobs()
 
     def run_jobs(self):
         now = _odoo_now()
@@ -495,6 +563,7 @@ class QueueJobRunner(object):
                 _logger.info("database connections ready")
                 # inner loop does the normal processing
                 while not self._stop:
+                    self.requeue_dead_jobs()
                     self.process_notifications()
                     self.run_jobs()
                     self.wait_notification()

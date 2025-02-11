@@ -330,42 +330,49 @@ class Database(object):
             UPDATE
                 queue_job
             SET
-                state=(
+                state = (
                     CASE
-                        WHEN
-                            max_retries IS NOT NULL AND
-                            retry IS NOT NULL AND
-                            retry>=max_retries
+                        WHEN max_retries IS NOT NULL 
+                            AND retry IS NOT NULL 
+                            AND retry >= max_retries
                         THEN 'failed'
                         ELSE 'pending'
-                    END),
-                retry=(CASE WHEN state='started' THEN COALESCE(retry,0)+1 ELSE retry END),
-                exc_info=(
+                    END
+                ),
+                retry = (
+                    CASE 
+                        WHEN state = 'started' THEN COALESCE(retry, 0) + 1 
+                        ELSE retry 
+                    END
+                ),
+                exc_info = (
                     CASE
-                        WHEN
-                            max_retries IS NOT NULL AND
-                            retry IS NOT NULL AND
-                            retry>=max_retries
+                        WHEN max_retries IS NOT NULL 
+                            AND retry IS NOT NULL 
+                            AND retry >= max_retries
                         THEN 'Job not completed, max retries reached'
                         ELSE exc_info
-                    END)
+                    END
+                )
             WHERE
-                id in (
-                    SELECT
-                        queue_job_id
-                    FROM
-                        queue_job_lock
-                    WHERE
-                        queue_job_id in (
-                            SELECT
-                                id
-                            FROM
-                                queue_job
-                            WHERE
-                                state IN ('enqueued','started')
-                                AND date_enqueued <
-                                (now() AT TIME ZONE 'utc' - INTERVAL '10 sec')
-                        )
+                id IN (
+                    SELECT queue_job_id
+                    FROM queue_job_lock
+                    WHERE queue_job_id IN (
+                        SELECT id
+                        FROM queue_job
+                        WHERE state IN ('enqueued', 'started')
+                        AND date_enqueued < (now() AT TIME ZONE 'utc' - INTERVAL '300 sec')
+                        AND date_created < (now() AT TIME ZONE 'utc' - INTERVAL '300 sec')
+                    )
+                    -- Ignore jobs with advisory locks
+                    AND queue_job_id NOT IN (
+                        SELECT objid
+                        FROM pg_locks 
+                        WHERE locktype = 'advisory' 
+                        AND classid = hashtext('queue_job_lock')
+                    )
+                    -- Ignore jobs with row-level locks
                     FOR UPDATE SKIP LOCKED
                 )
             RETURNING uuid, state, name, method_name
@@ -563,10 +570,10 @@ class QueueJobRunner(object):
                 _logger.info("database connections ready")
                 # inner loop does the normal processing
                 while not self._stop:
-                    self.requeue_dead_jobs()
                     self.process_notifications()
                     self.run_jobs()
                     self.wait_notification()
+                    self.requeue_dead_jobs()
             except KeyboardInterrupt:
                 self.stop()
             except Exception as e:

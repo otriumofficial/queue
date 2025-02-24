@@ -54,14 +54,15 @@ class RunJobController(http.Controller):
         #       update queue_job set=state=started
         #       where state=enqueid and id=
         job.set_started()
-        job.store()
+        odoo_job_id = job.store()
         http.request.env.cr.commit()
-        job.lock()
+        job.lock(odoo_job_id)
         _logger.debug('%s started', job)
         job.perform()
         job.set_done()
         job.store()
         http.request.env.cr.commit()
+        job.unlock(odoo_job_id)
         _logger.debug('%s done', job)
 
     @http.route('/queue_job/session', type='http', auth="none")

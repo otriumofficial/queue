@@ -272,39 +272,30 @@ class Job(object):
             [self.uuid],
         )
 
-    def lock(self):
+    def lock(self, odoo_job_id):
         """
         Lock row of job that is being performed
         If a job cannot be locked,
         it means that the job wasn't started,
         a RetryableJobError is thrown.
         """
-        self.env.cr.execute(
-                        """
-            SELECT
-                *
-            FROM
-                queue_job_lock
-            WHERE
-                queue_job_id in (
-                    SELECT
-                        id
-                    FROM
-                        queue_job
-                    WHERE
-                        uuid = %s
-                        AND state='started'
-                )
-            FOR UPDATE
-        """,
-            [self.uuid],
-        )
+        # Try to lock the job
+        self.env.cr.execute("SELECT 1 FROM pg_locks WHERE locktype = 'advisory' AND classid = hashtext('queue_job_lock') AND objid = %s", (odoo_job_id,))
+        if self.env.cr.fetchone():
+            # Lock already exists, job may have been manually requeued or
+            # the db connection was lost during previous job execution
+            # Release the lock and set a new one
+            self.env.cr.execute("SELECT pg_advisory_unlock(hashtext('queue_job_lock'), %s)", (odoo_job_id,))
 
-        # 1 job should be locked
-        if 1 != len(self.env.cr.fetchall()):
-            raise RetryableJobError(
-                                f"Trying to lock job that wasn't started, uuid: {self.uuid}"
-            )
+        self.env.cr.execute("SELECT pg_advisory_lock(hashtext('queue_job_lock'), %s)", (odoo_job_id,))
+        self.env.cr.commit()
+
+    def unlock(self, odoo_job_id):
+        """
+        Unlock row of job that is being performed
+        """
+        self.env.cr.execute("SELECT pg_advisory_unlock(hashtext('queue_job_lock'), %s)", (odoo_job_id,))
+        self.env.cr.commit()
 
     @classmethod
     def _load_from_db_record(cls, job_db_record):
@@ -593,6 +584,7 @@ class Job(object):
                 }
             )
             self.env[self.job_model_name].sudo().create(vals)
+        return db_record.id
 
     @property
     def func_string(self):

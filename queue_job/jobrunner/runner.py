@@ -325,6 +325,28 @@ class Database(object):
                        "WHERE uuid=%s",
                        (ENQUEUED, uuid))
 
+    def _check_dead_jobs(self):
+        return """
+            SELECT queue_job_id
+            FROM queue_job_lock
+            WHERE queue_job_id IN (
+                SELECT id
+                FROM queue_job
+                WHERE state IN ('enqueued', 'started')
+                AND date_enqueued < (now() AT TIME ZONE 'utc' - INTERVAL '300 sec')
+                AND date_created < (now() AT TIME ZONE 'utc' - INTERVAL '300 sec')
+            )
+            -- Ignore jobs with advisory locks
+            AND queue_job_id NOT IN (
+                SELECT objid
+                FROM pg_locks 
+                WHERE locktype = 'advisory' 
+                AND classid = hashtext('queue_job_lock')
+            )
+            -- Ignore jobs with row-level locks
+            FOR UPDATE SKIP LOCKED
+            """
+    
     def _query_requeue_dead_jobs(self):
         return """
             UPDATE
@@ -365,6 +387,7 @@ class Database(object):
                         AND date_enqueued < (now() AT TIME ZONE 'utc' - INTERVAL '300 sec')
                         AND date_created < (now() AT TIME ZONE 'utc' - INTERVAL '300 sec')
                     )
+                    AND queue_job_id IN %s
                     -- Ignore jobs with advisory locks
                     AND queue_job_id NOT IN (
                         SELECT objid
@@ -378,7 +401,7 @@ class Database(object):
             RETURNING uuid, state, name, method_name
             """
 
-    def requeue_dead_jobs(self):
+    def requeue_dead_jobs(self, dead_jobs_to_check):
         """
         Set started and enqueued jobs but not locked to pending
         A job is locked when it's being executed
@@ -398,19 +421,50 @@ class Database(object):
         """
         pending_job_info = []
         failed_job_info = []
+        recheck_job_ids = []
+        new_dead_jobs_to_check = []
 
         with closing(self.conn.cursor()) as cr:
-            query = self._query_requeue_dead_jobs()
-            cr.execute(query)
-            for (uuid, state, name, method) in cr.fetchall():
-                if state == PENDING:
-                    pending_job_info.append((uuid, name, method))
-                    _logger.warning("Re-queued inactive job with UUID: %s", uuid)
-                elif state == FAILED:
-                    failed_job_info.append((uuid, name, method))
-                    _logger.warning("Inactive job marked as failed with UUID: %s", uuid)
+            if dead_jobs_to_check:
+                query = self._query_requeue_dead_jobs()
 
-        return pending_job_info, failed_job_info
+                job_ids_to_check_requeue = []
+                # Only potentially requeue job ids with a check timestamp in the past
+                for job_id, check_timestamp in dead_jobs_to_check:
+                    if check_timestamp < datetime.datetime.now():
+                        job_ids_to_check_requeue.append(job_id)
+                    else:
+                        recheck_job_ids.append(job_id)
+                        new_dead_jobs_to_check.append((job_id, check_timestamp))
+
+                if job_ids_to_check_requeue:
+                    cr.execute(query, (tuple(job_ids_to_check_requeue),))
+                    for (uuid, state, name, method) in cr.fetchall():
+                        if state == PENDING:
+                            pending_job_info.append((uuid, name, method))
+                            _logger.warning("Re-queued inactive job with UUID: %s", uuid)
+                        elif state == FAILED:
+                            failed_job_info.append((uuid, name, method))
+                            _logger.warning("Inactive job marked as failed with UUID: %s", uuid)
+            
+            # Check for jobs to possibly requeue on the next run
+            query = self._check_dead_jobs()
+            cr.execute(query)
+            new_dead_jobs_to_check = []
+            for row in cr.fetchall():
+                job_id = row[0]
+                # Check if the job is already in the list
+                if job_id not in recheck_job_ids:
+                    # Add the job ID and the current timestamp + 60 seconds
+                    # to the new_dead_jobs_to_check list
+                    new_dead_jobs_to_check.append(
+                        (
+                            job_id,
+                            datetime.datetime.now() + datetime.timedelta(seconds=60),
+                        )
+                    )
+
+        return new_dead_jobs_to_check, pending_job_info, failed_job_info
 
 
 class QueueJobRunner(object):
@@ -432,6 +486,7 @@ class QueueJobRunner(object):
             channel_config_string = _channels()
         self.channel_manager.simple_configure(channel_config_string)
         self.db_by_name = {}
+        self.dead_jobs_to_check_by_db = {}
         self._stop = False
         self._stop_pipe = os.pipe()
 
@@ -490,7 +545,16 @@ class QueueJobRunner(object):
     def requeue_dead_jobs(self):
         for db in self.db_by_name.values():
             if db.has_queue_job:
-                db.requeue_dead_jobs()
+                (
+                    dead_jobs_to_check_by_db,
+                    _pending_job_info,
+                    _failed_job_info,
+                ) = db.requeue_dead_jobs(
+                    self.dead_jobs_to_check_by_db.get(db.db_name, [])
+                )
+                self.dead_jobs_to_check_by_db[
+                    db.db_name
+                ] = dead_jobs_to_check_by_db
 
     def run_jobs(self):
         now = _odoo_now()
